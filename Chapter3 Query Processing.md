@@ -2,24 +2,31 @@
 typora-copy-images-to: ./images
 ---
 
+[TOC]
+
 # Chapter 3  Query Processing
 
 ## 3.1. Overview
 
 1. Parser
-2. The parser generates a parse tree from an SQL statement in plain text.
 
-3. Analyzer/Analyser
-4. The analyzer/analyser carries out a semantic analysis of a parse tree and generates a query tree.
+   The parser generates a parse tree from an SQL statement in plain text.
 
-5. Rewriter
-6. The rewriter transforms a query tree using the rules stored in the [rule system](http://www.postgresql.org/docs/current/static/rules.html) if such rules exist.
+2. Analyzer/Analyser
 
-7. Planner
-8. The planner generates the plan tree that can most effectively be executed from the query tree.
+   The analyzer/analyser carries out a semantic analysis of a parse tree and generates a query tree.
 
-9. Executor
-10. The executor executes the query via accessing the tables and indexes in the order that was created by the plan tree.
+3. Rewriter
+
+   The rewriter transforms a query tree using the rules stored in the [rule system](http://www.postgresql.org/docs/current/static/rules.html) if such rules exist.
+
+4. Planner
+
+   The planner generates the plan tree that can most effectively be executed from the query tree.
+
+5. Executor
+
+   The executor executes the query via accessing the tables and indexes in the order that was created by the plan tree.
 
 <img src="images/image-20230315131519589.png" alt="image-20230315131519589" style="zoom:33%;" />
 
@@ -669,65 +676,406 @@ C~outer~是扫描外表的开销，内表同理。外表只需要扫描一次，
 
 #### 3.5.1.2. Materialized Nested Loop Join
 
+在nested loop join中，外表中的每一个元组都要遍历内表的全部元组，为了加快这一过程，首先将内表元组全部写到work_mem或者临时文件中，通过*temporary tuple storage*特性。避免每次通过buffer pool来读取。这样的扫描称为rescan。
 
+<img src="images/image-20230316192717674.png" alt="image-20230316192717674" style="zoom:67%;" />
 
+```sql
+testdb=# EXPLAIN SELECT * FROM tbl_a AS a, tbl_b AS b WHERE a.id = b.id;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Nested Loop  (cost=0.00..750230.50 rows=5000 width=16)
+   Join Filter: (a.id = b.id)
+   ->  Seq Scan on tbl_a a  (cost=0.00..145.00 rows=10000 width=8)
+   ->  Materialize  (cost=0.00..98.00 rows=5000 width=8)
+         ->  Seq Scan on tbl_b b  (cost=0.00..73.00 rows=5000 width=8)
+(5 rows)
+```
 
+见上方查询计划，首先顺序读取b表并进行物化，然后b作为内表，a作为外表进行nested loop join。
+
+物化操作的开销：
+
+> start-up cost = 0
+>
+> run cost = 2 × cpu_operator_cost × N~inner~ = 2 × 0.0025 × 5000 = 25.0 乘2是因为先读后写
+>
+> total cost = (start-up cost + total cost of seq scan) + run cost = (0.0 + 73.0) + 25.0 = 98.0
+
+nested loop开销：
+
+> start-up cost = 0
+>
+> rescan cost = cpu_operator_cost × N~inner~ = 0.0025 × 5000 = 12.5
+>
+> run cost = (cpu_operator_cost + cpu_tuple_cost ) × N~inner~ × N~outer~ + rescancost × (N~outer~ − 1) 
+>
+> ​					+ C^total^~outer,seqscan~ + C^total^~materialize
+>
+> C^total^~outer,seqscan~ is the total scan cost of the outer table and C^total^~materialize is the total cost of the materialized
+>
+> run cost = (0.0025 + 0.01) × 5000 × 10000 + 12.5 × (10000 − 1) + 145.0 + 98.0 = 750230.5
 
 #### 3.5.1.3. Indexed Nested Loop Join
 
+nested loop + index是非常常见的情景，通常在内表建立索引，这样可以快速匹配外表的元组
 
+![image-20230316194236236](images/image-20230316194236236.png)
 
+```sql
+testdb=# EXPLAIN SELECT * FROM tbl_c AS c, tbl_b AS b WHERE c.id = b.id;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Nested Loop  (cost=0.29..1935.50 rows=5000 width=16)
+   ->  Seq Scan on tbl_b b (cost=0.00..73.00 rows=5000 width=8)
+   ->  Index Scan using tbl_c_pkey on tbl_c c  (cost=0.29..0.36 rows=1 width=8)
+         Index Cond: (id = b.id)
+(4 rows)
+```
 
+如上查询计划所示，c表为内表，第六行显示了tbl_c_pkey辅助内表搜索的情况，第七行的条件id=b.id表示b为外表。这样的索引搜索也称为 **parameterized (index) path**. 
+
+> start-up cost = 0.285 (index scan cost : line 6)
+>
+> total cost =  (cpu_tuple_cost + C^total^~inner,parameterized~) × N~outer~ + C^run^~outer,seqscan~
+>
+> ​				  = (0.01 + 0.3625) × 5000 + 73.0 = 1935.5
+
+可以看出，内表有索引的情况下，开销为O(N~outer~)，也就是和外表的元组数成正比
 
 #### 3.5.1.4. Other Variations
 
+之前介绍了内表上有索引，而外表上在join列有索引时也可以减小开销（当外表中的索引列出现在join的where条件中时），此时外表的sequential scan变成了index scan
 
+![image-20230317104714409](images/image-20230317104714409.png)
 
+(a) nested loop join with outer index scan
 
+```sql
+testdb=# SET enable_hashjoin TO off;
+SET
+testdb=# SET enable_mergejoin TO off;
+SET
+testdb=# EXPLAIN SELECT * FROM tbl_c AS c, tbl_b AS b WHERE c.id = b.id AND c.id = 500;
+                                   QUERY PLAN                       
+--------------------------------------------------------------------------------
+ Nested Loop  (cost=0.29..93.81 rows=1 width=16)
+   ->  Index Scan using tbl_c_pkey on tbl_c c  (cost=0.29..8.30 rows=1 width=8)
+         Index Cond: (id = 500)
+   ->  Seq Scan on tbl_b b  (cost=0.00..85.50 rows=1 width=8)
+         Filter: (id = 500)
+(5 rows)
+```
+
+(2) materialized nested loop join with outer index scan
+
+```sql
+testdb=# SET enable_hashjoin TO off;
+SET
+testdb=# SET enable_mergejoin TO off;
+SET
+testdb=# EXPLAIN SELECT * FROM tbl_c AS c, tbl_b AS b WHERE c.id = b.id AND c.id < 40 AND b.id < 10;
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Nested Loop  (cost=0.29..99.76 rows=1 width=16)
+   Join Filter: (c.id = b.id)
+   ->  Index Scan using tbl_c_pkey on tbl_c c  (cost=0.29..8.97 rows=39 width=8)
+         Index Cond: (id < 40)
+   ->  Materialize  (cost=0.00..85.55 rows=9 width=8)
+         ->  Seq Scan on tbl_b b  (cost=0.00..85.50 rows=9 width=8)
+               Filter: (id < 10)
+(7 rows)
+```
+
+(3) indexed nested loop join with outer index scan
+
+```sql
+testdb=# SET enable_hashjoin TO off;
+SET
+testdb=# SET enable_mergejoin TO off;
+SET
+testdb=# EXPLAIN SELECT * FROM tbl_a AS a, tbl_d AS d WHERE a.id = d.id AND a.id <  40;
+                                   QUERY PLAN                                   
+---------------------------------------------------------------------------------
+ Nested Loop  (cost=0.57..173.06 rows=20 width=16)
+   ->  Index Scan using tbl_a_pkey on tbl_a a  (cost=0.29..8.97 rows=39 width=8)
+         Index Cond: (id < 40)
+   ->  Index Scan using tbl_d_pkey on tbl_d d  (cost=0.28..4.20 rows=1 width=8)
+         Index Cond: (id = a.id)
+(5 rows)
+```
 
 ### 3.5.2. Merge Join
 
+merge join只能被用在natural join和equi-join的情况下
 
+[Join (SQL) - Wikipedia](https://en.wikipedia.org/wiki/Join_(SQL)#Equi-join)
+
+merge join的启动开销为内外表的排序开销，执行开销为扫描内外表的开销
+
+> start-up cost = O( N~outer~log2(N~outer~) + N~inner~log2(N~inner~) )
+>
+> run cost = O(N~outer~+N~inner~)
 
 #### 3.5.2.1. Merge Join
 
+如果所有元组都能放入内存，直接在内存中进行快排，否则还要使用临时文件进行磁盘排序
 
+![image-20230317110011012](images/image-20230317110011012.png)
+
+```sql
+testdb=# EXPLAIN SELECT * FROM tbl_a AS a, tbl_b AS b WHERE a.id = b.id AND b.id < 1000;
+                               QUERY PLAN
+-------------------------------------------------------------------------
+ Merge Join  (cost=944.71..984.71 rows=1000 width=16)
+   Merge Cond: (a.id = b.id)
+   ->  Sort  (cost=809.39..834.39 rows=10000 width=8)
+         Sort Key: a.id
+         ->  Seq Scan on tbl_a a  (cost=0.00..145.00 rows=10000 width=8)
+   ->  Sort  (cost=135.33..137.83 rows=1000 width=8)
+         Sort Key: b.id
+         ->  Seq Scan on tbl_b b  (cost=0.00..85.50 rows=1000 width=8)
+               Filter: (id < 1000)
+(9 rows)
+```
+
+如上查询树，第8行和11行分别显示对两个表通过顺序扫描进行了排序；第4行显示，merge join的内表是b，外表是a。
 
 #### 3.5.2.2. Materialized Merge Join
 
+merge join同样可以通过物化内表来加速
 
+![image-20230317110459597](images/image-20230317110459597.png)
+
+与之前唯一不同的是，内表b在排序后进行了物化操作（line9）
+
+```sql
+testdb=# EXPLAIN SELECT * FROM tbl_a AS a, tbl_b AS b WHERE a.id = b.id;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Merge Join  (cost=10466.08..10578.58 rows=5000 width=2064)
+   Merge Cond: (a.id = b.id)
+   ->  Sort  (cost=6708.39..6733.39 rows=10000 width=1032)
+         Sort Key: a.id
+         ->  Seq Scan on tbl_a a  (cost=0.00..1529.00 rows=10000 width=1032)
+   ->  Materialize  (cost=3757.69..3782.69 rows=5000 width=1032)
+         ->  Sort  (cost=3757.69..3770.19 rows=5000 width=1032)
+               Sort Key: b.id
+               ->  Seq Scan on tbl_b b  (cost=0.00..1193.00 rows=5000 width=1032)
+(9 rows)
+```
 
 #### 3.5.2.3. Other Variations
 
+![image-20230317110639137](images/image-20230317110639137.png)
+
+(a) merge join with outer index scan
+
+```sql
+testdb=# SET enable_hashjoin TO off;
+SET
+testdb=# SET enable_nestloop TO off;
+SET
+testdb=# EXPLAIN SELECT * FROM tbl_c AS c, tbl_b AS b WHERE c.id = b.id AND b.id < 1000;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Merge Join  (cost=135.61..322.11 rows=1000 width=16)
+   Merge Cond: (c.id = b.id)
+   ->  Index Scan using tbl_c_pkey on tbl_c c  (cost=0.29..318.29 rows=10000 width=8)
+   ->  Sort  (cost=135.33..137.83 rows=1000 width=8)
+         Sort Key: b.id
+         ->  Seq Scan on tbl_b b  (cost=0.00..85.50 rows=1000 width=8)
+               Filter: (id < 1000)
+(7 rows)
+```
+
+(b) materialized merge join with outer index scan
+
+```sql
+testdb=# SET enable_hashjoin TO off;
+SET
+testdb=# SET enable_nestloop TO off;
+SET
+testdb=# EXPLAIN SELECT * FROM tbl_c AS c, tbl_b AS b WHERE c.id = b.id AND b.id < 4500;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Merge Join  (cost=421.84..672.09 rows=4500 width=16)
+   Merge Cond: (c.id = b.id)
+   ->  Index Scan using tbl_c_pkey on tbl_c c  (cost=0.29..318.29 rows=10000 width=8)
+   ->  Materialize  (cost=421.55..444.05 rows=4500 width=8)
+         ->  Sort  (cost=421.55..432.80 rows=4500 width=8)
+               Sort Key: b.id
+               ->  Seq Scan on tbl_b b  (cost=0.00..85.50 rows=4500 width=8)
+                     Filter: (id < 4500)
+(8 rows)
+```
+
+(c) indexed merge join with outer index scan
+
+```sql
+testdb=# SET enable_hashjoin TO off;
+SET
+testdb=# SET enable_nestloop TO off;
+SET
+testdb=# EXPLAIN SELECT * FROM tbl_c AS c, tbl_d AS d WHERE c.id = d.id AND d.id < 1000;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Merge Join  (cost=0.57..226.07 rows=1000 width=16)
+   Merge Cond: (c.id = d.id)
+   ->  Index Scan using tbl_c_pkey on tbl_c c  (cost=0.29..318.29 rows=10000 width=8)
+   ->  Index Scan using tbl_d_pkey on tbl_d d  (cost=0.28..41.78 rows=1000 width=8)
+         Index Cond: (id < 1000)
+(5 rows)
+```
+
+如果merge join列有索引，则省去了这个表的排序操作，因为索引本身有序
+
+### 3.5.3. Hash Join
+
+和merge join一样，hash join也只能用于natural join和equi-join
+
+PG中的hash join方式取决于表的大小。如果内表大小小于25% work_mem，直接使用in-memory hash join，否则使用hybrid hash join
+
+#### 3.5.3.1. In-Memory Hash Join
+
+PG中的哈希表区域称为batch，batch含有多个slots(buckets)
+
+内表大小足够小时，在内存中实现两阶段hash-join，分别是build和probe阶段。
+
+考虑下面的语句：
+
+> ```sql
+> SELECT * FROM tbl_outer AS outer, tbl_inner AS inner WHERE inner.attr1 = outer.attr2;
+> ```
+
+Build阶段如下：
+
+![image-20230317131641216](images/image-20230317131641216.png)
+
+Probe阶段如下：
+
+![image-20230317132015079](images/image-20230317132015079.png)
 
 
 
+#### 3.5.3.2. Hybrid Hash Join with Skew
 
 
+
+#### 3.5.3.3. Index Scans in Hash Join
+
+```sql
+testdb=# EXPLAIN SELECT * FROM pgbench_accounts AS a, pgbench_branches AS b
+testdb-#                                              WHERE a.bid = b.bid AND a.aid BETWEEN 100 AND 1000;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Hash Join  (cost=1.88..51.93 rows=865 width=461)
+   Hash Cond: (a.bid = b.bid)
+   ->  Index Scan using pgbench_accounts_pkey on pgbench_accounts a  (cost=0.43..47.73 rows=865 width=97)
+         Index Cond: ((aid >= 100) AND (aid <= 1000))
+   ->  Hash  (cost=1.20..1.20 rows=20 width=364)
+         ->  Seq Scan on pgbench_branches b  (cost=0.00..1.20 rows=20 width=364)
+(6 rows)
+```
+
+
+
+### 3.5.4. Join Access Paths and Join Nodes
+
+#### 3.5.4.1. Join Access Paths
+
+An access path of the nested loop join is the [JoinPath](javascript:void(0)) structure, and other join access paths, [MergePath](javascript:void(0)) and [HashPath](javascript:void(0)), are based on it.
+
+![image-20230317132516306](images/image-20230317132516306.png)
+
+#### 3.5.4.2. Join Nodes
+
+This subsection shows the three join nodes without explanation: [NestedLoopNode](javascript:void(0)), [MergeJoinNode](javascript:void(0)) and [HashJoinNode](javascript:void(0)). They are based on [JoinNode](javascript:void(0)).
 
 ## 3.6. Creating the Plan Tree of Multiple-Table Query
 
+### 3.6.1. Preprocessing
 
+1. Planning and Converting CTE
+2. If there are WITH lists, the planner processes each WITH query by the SS_process_ctes() function.
 
+3. Pulling Subqueries Up
+4. If the FROM clause has a subquery and it does not have GROUP BY, HAVING, ORDER BY, LIMIT and DISTINCT clauses, and also it does not use INTERSECT or EXCEPT, the **planner converts to a join form** by the pull_up_subqueries() function. For example, the query shown below which contains a subquery in the FROM clause can be converted to a natural join query. Needless to say, this conversion is done in the query tree.
 
+5. ```sql-monosp
+   testdb=# SELECT * FROM tbl_a AS a, (SELECT * FROM tbl_b) as b WHERE a.id = b.id;
+   	 	       	     ↓
+   testdb=# SELECT * FROM tbl_a AS a, tbl_b as b WHERE a.id = b.id;
+   ```
 
+6. Transforming an Outer Join to an Inner Join
+7. The planner transforms an outer join query to an inner join query if possible.
 
+### 3.6.2. Getting the Cheapest Path
 
+查询涉及的表数少于12个时，使用动态规划算法选择最优计划；否则退化为genetic algorithm
 
+ ***Genetic Query Optimizer***
 
+> When a query joining many tables is executed, a huge amount of time will be needed to optimize the query plan. To deal with this situation, PostgreSQL implements an interesting feature: the [Genetic Query Optimizer](http://www.postgresql.org/docs/current/static/geqo.html). **This is a kind of approximate algorithm to determine a reasonable plan within a reasonable time.** Hence, in the query optimization stage, if the number of the joining tables is higher than the threshold specified by the parameter [geqo_threshold](http://www.postgresql.org/docs/current/static/runtime-config-query.html#GUC-GEQO-THRESHOLD) (the default is 12), PostgreSQL generates a query plan using the genetic algorithm.
 
+动态规划算法的思路如下：
 
+- *Level = 1*
+- Get the cheapest path of each table; the cheapest path is stored in the respective RelOptInfo. 找到每个表的最优路径
 
+- *Level = 2*
+- Get the cheapest path for each combination that **selects two** from all the tables.
 
+- For example, if there are two tables, A and B, get the cheapest join path of tables A and B, and this is the final answer.
 
+- In the following, the RelOptInfo of two tables is represented by {A, B}.
 
-# ML For PG
+- If there are three tables, get the cheapest path for each of {A, B}, {A, C} and {B, C}.
 
-[s-hironobu/pg_plan_inspector: A framework to monitor and improve the performance of PostgreSQL using Machine Learning methods. (github.com)](https://github.com/s-hironobu/pg_plan_inspector)
+- *Level = 3 and higher*
+- The same processing is continued **until the level that equals the number of tables** is reached.
 
+- ![image-20230317133430175](images/image-20230317133430175.png)
 
+测试环境如下，考虑查询：`SELECT * FROM tbl_a AS a, tbl_b AS b WHERE a.id = b.id AND b.data < 400;`
 
+![image-20230317134000987](images/image-20230317134000987.png)
 
+#### 3.6.2.1. Processing in Level 1
 
+第一步，获取单表的最小开销，为每个表创建RelOptInfo，获取开销后加入到PlannerInfo中的simple_rel_array中。如下图，a表有索引，所以最小开销是indexscan path，而b表是seqscan path。
 
+需要注意的是cheapest_parameterized_path这个字段
+
+> As described in Section 3.5.1.3, the planner considers the use of the parameterized path for the **indexed nested loop join** (and rarely the indexed merge join with an outer index scan). The cheapest parameterized cost is the cheapest cost of the estimated parameterized paths.
+
+![image-20230317134042516](images/image-20230317134042516.png)
+
+#### 3.6.2.2. Processing in Level 2
+
+第二阶段，开始组合表。Planner从simple_rel_array中组合单表，并将组合信息添加到join_rel_list中。然后考虑所有可能的join path，选择开销最小的。
+
+![image-20230317134613550](images/image-20230317134613550.png)
+
+- *SeqScanPath(table)* means the sequential scan path of table.
+- *Materialized->SeqScanPath(table)* means the materialized sequential scan path of a table.
+- *IndexScanPath(table, attribute)* means the index scan path by the attribute of the a table.
+- *ParameterizedIndexScanPath(table, attribute1, attribute2)* means the parameterized index path by the attribute1 of the table, and it is parameterized by attribute2 of the outer table.
+
+考虑两个表join的所有情况：
+
+![image-20230317142459199](images/image-20230317142459199.png)
+
+### 3.6.3. Getting the Cheapest Path of a Triple-Table Query
+
+假设有三个表：
+
+<img src="images/image-20230317143337233.png" alt="image-20230317143337233" style="zoom: 33%;" />
+
+执行三表join时的执行计划如下：
+
+![image-20230317143418744](images/image-20230317143418744.png)
+
+可以看出，优化器选择的最优计划是(<a,b>,c)。最外面的join是nested loop join，内表是c表，还使用了parameterized index scan，外表是a,b进行hash join之后的表。由于a,b都没有索引，所以大概率选择了hash join。
 
